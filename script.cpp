@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <WiFiManager.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
@@ -13,22 +14,53 @@ const int relayPin      = 26;
 const int resetPin      = 14; // hold to GND on boot to reset all settings
 
 // ---- FLOW CALIBRATION ----
+// NOTE: 374.0 was calibrated by hand-pouring. Pressurized line flow will
+// differ slightly. Once plumbed: run one measured fill, compare the
+// "CALIBRATION" line in Serial output against actual volume dispensed,
+// and update this constant.
 const float pulsesPerLiter = 374.0; // calibrated from real-world testing
 const float targetGallons  = 5.0;
 const float targetLiters   = targetGallons * 3.78541;
 long targetPulses;
 
+// ---- SAFETY LIMITS ----
+// NOTE: 3 min is a placeholder until the system is plumbed under pressure.
+// After the first real fill, read the duration from the "CALIBRATION" line
+// in Serial output and set this to roughly 2x that value, so a slow day
+// (low line pressure) doesn't trip the timeout on legitimate fills.
+const unsigned long maxFillTimeMs   = 180000; // hard cap: abort if fill takes > 3 min
+const unsigned long noFlowTimeoutMs = 10000;  // abort if no pulses for 10 s mid-fill
+
+// ---- NON-BLOCKING TIMERS ----
+const unsigned long lcdIntervalMs       = 250;   // LCD refresh rate while filling
+const unsigned long retryIntervalMs     = 15000; // gap between webhook retry attempts
+const unsigned long wifiRetryIntervalMs = 15000; // gap between WiFi reconnect attempts
+
 // ---- RUNTIME VARIABLES ----
 volatile long pulseCount = 0;
 volatile unsigned long lastPulseTime = 0;
 bool filling = false;
+bool buttonWasReleased = true; // require release between presses
+unsigned long fillStartMs     = 0;
+long          lastFlowPulses  = 0;
+unsigned long lastFlowMs      = 0;
+unsigned long lastLcdMs       = 0;
+unsigned long lastRetryMs     = 0;
+unsigned long lastWifiTryMs   = 0;
 
 // ---- PERSISTENT STORAGE ----
 Preferences prefs;
-long fillCount       = 0;
-long pendingRetries  = 0;
+long fillCount = 0;
 unsigned long lastEventId = 0;
 char webhookUrl[200] = "";
+
+// ---- PENDING WEBHOOK QUEUE ----
+// Each record: "eventId|fillCountAtEvent|timestamp"
+// The event ID is generated ONCE per fill and reused on every retry,
+// so the POS can deduplicate if a response was lost but the POST landed.
+const int MAX_PENDING = 10;
+String pendingQueue[MAX_PENDING];
+int pendingCount = 0;
 
 // ---- DEVICE IDENTITY (auto from MAC) ----
 String machineId;
@@ -46,6 +78,48 @@ void IRAM_ATTR countPulse() {
     pulseCount++;
     lastPulseTime = now;
   }
+}
+
+// =====================
+// PENDING QUEUE PERSISTENCE
+// =====================
+void savePendingQueue() {
+  String joined = "";
+  for (int i = 0; i < pendingCount; i++) {
+    if (i > 0) joined += '\n';
+    joined += pendingQueue[i];
+  }
+  prefs.putString("pendingQ", joined);
+}
+
+void loadPendingQueue() {
+  pendingCount = 0;
+  String joined = prefs.getString("pendingQ", "");
+  int start = 0;
+  while (start < (int)joined.length() && pendingCount < MAX_PENDING) {
+    int nl = joined.indexOf('\n', start);
+    if (nl < 0) nl = joined.length();
+    String rec = joined.substring(start, nl);
+    if (rec.length() > 0) pendingQueue[pendingCount++] = rec;
+    start = nl + 1;
+  }
+}
+
+void enqueuePending(const String& eventId, long countAtEvent, const String& timestamp) {
+  // If full, drop the oldest record to make room
+  if (pendingCount >= MAX_PENDING) {
+    for (int i = 1; i < MAX_PENDING; i++) pendingQueue[i - 1] = pendingQueue[i];
+    pendingCount = MAX_PENDING - 1;
+    Serial.println("Pending queue full - dropped oldest event.");
+  }
+  pendingQueue[pendingCount++] = eventId + "|" + String(countAtEvent) + "|" + timestamp;
+  savePendingQueue();
+}
+
+void dequeuePending() {
+  for (int i = 1; i < pendingCount; i++) pendingQueue[i - 1] = pendingQueue[i];
+  pendingCount--;
+  savePendingQueue();
 }
 
 // =====================
@@ -89,16 +163,17 @@ void setup() {
 
   // Load saved values from flash
   prefs.begin("waterstation", false);
-  fillCount      = prefs.getLong("fillCount", 0);
-  pendingRetries = prefs.getLong("pendingRetries", 0);
-  lastEventId    = prefs.getULong("lastEventId", 0);
+  fillCount   = prefs.getLong("fillCount", 0);
+  lastEventId = prefs.getULong("lastEventId", 0);
   String savedUrl = prefs.getString("webhookUrl", "");
   savedUrl.toCharArray(webhookUrl, 200);
+  prefs.remove("pendingRetries"); // migrate away from old counter-based retry key
+  loadPendingQueue();
 
   Serial.print("Loaded fill count: ");
   Serial.println(fillCount);
-  Serial.print("Pending retries: ");
-  Serial.println(pendingRetries);
+  Serial.print("Pending webhooks: ");
+  Serial.println(pendingCount);
   Serial.print("Webhook URL: ");
   Serial.println(webhookUrl);
 
@@ -110,6 +185,7 @@ void setup() {
     WiFiManager wm;
     wm.resetSettings();
     prefs.remove("webhookUrl");
+    prefs.remove("pendingQ");
     delay(2000);
     ESP.restart();
   }
@@ -245,14 +321,38 @@ void updateLCDDone() {
   updateLCDReady();
 }
 
+void updateLCDAborted(const char* reason) {
+  lcd.setCursor(0, 0);
+  lcd.print("Fill stopped!   ");
+  lcd.setCursor(0, 1);
+  char line[17];
+  snprintf(line, sizeof(line), "%-16s", reason);
+  lcd.print(line);
+  delay(3000);
+  updateLCDReady();
+}
+
 // =====================
 // FILL CYCLE
 // =====================
 void startFill() {
-  pulseCount = 0;
-  filling    = true;
+  pulseCount     = 0;
+  filling        = true;
+  fillStartMs    = millis();
+  lastFlowPulses = 0;
+  lastFlowMs     = millis();
+  lastLcdMs      = 0;
   digitalWrite(relayPin, HIGH); // open solenoid valve
   Serial.println("Fill started...");
+}
+
+// Abort without counting a jug (cancel, no-flow, or timeout)
+void abortFill(const char* reason) {
+  filling = false;
+  digitalWrite(relayPin, LOW); // close solenoid valve immediately
+  Serial.print("Fill aborted: ");
+  Serial.println(reason);
+  updateLCDAborted(reason);
 }
 
 void stopFill() {
@@ -265,10 +365,26 @@ void stopFill() {
   Serial.print("Fill complete. Total dispensed: ");
   Serial.println(fillCount);
 
-  // Send webhook to POS
-  if (!sendWebhook(fillCount)) {
-    pendingRetries++;
-    prefs.putLong("pendingRetries", pendingRetries);
+  // Data for tuning pulsesPerLiter and maxFillTimeMs after plumbing:
+  // compare pulses against actual volume dispensed, and set maxFillTimeMs
+  // to roughly 2x the measured duration.
+  unsigned long fillSecs = (millis() - fillStartMs) / 1000;
+  Serial.print("CALIBRATION: pulses=");
+  Serial.print(pulseCount);
+  Serial.print(" duration=");
+  Serial.print(fillSecs);
+  Serial.println("s");
+
+  // Generate the event ID ONCE per fill; retries reuse it so the POS
+  // can deduplicate if our POST landed but the response was lost.
+  lastEventId++;
+  prefs.putULong("lastEventId", lastEventId);
+  String eventId   = machineId + "-" + String(lastEventId);
+  String timestamp = getTimestamp();
+
+  // Send webhook to POS; queue the exact event snapshot on failure
+  if (!sendWebhook(eventId, fillCount, timestamp)) {
+    enqueuePending(eventId, fillCount, timestamp);
     Serial.println("Webhook failed - queued for retry.");
   }
 
@@ -278,31 +394,36 @@ void stopFill() {
 // =====================
 // WEBHOOK
 // =====================
-bool sendWebhook(long countAtEvent) {
+bool sendWebhook(const String& eventId, long countAtEvent, const String& timestamp) {
   if (WiFi.status() != WL_CONNECTED) return false;
   if (strlen(webhookUrl) == 0) {
     Serial.println("No webhook URL configured.");
     return false;
   }
 
-  // Unique event ID = machineId + incrementing counter
-  // Prevents duplicate inventory count if webhook is retried
-  lastEventId++;
-  prefs.putULong("lastEventId", lastEventId);
-  String eventId = machineId + "-" + String(lastEventId);
-
   HTTPClient http;
-  http.begin(webhookUrl);
+  WiFiClientSecure secureClient;
+  WiFiClient plainClient;
+
+  // HTTPS URLs need a secure client on ESP32
+  bool isHttps = (strncmp(webhookUrl, "https://", 8) == 0);
+  if (isHttps) {
+    secureClient.setInsecure(); // skip cert validation (no CA store on device)
+    if (!http.begin(secureClient, webhookUrl)) return false;
+  } else {
+    if (!http.begin(plainClient, webhookUrl)) return false;
+  }
+
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(10000); // 10 second timeout
 
   String payload = "{";
-  payload += "\"event_id\":\""       + eventId             + "\",";
-  payload += "\"machine_id\":\""     + machineId           + "\",";
+  payload += "\"event_id\":\""       + eventId              + "\",";
+  payload += "\"machine_id\":\""     + machineId            + "\",";
   payload += "\"quantity\":1,";
   payload += "\"unit\":\"5gal\",";
   payload += "\"total_dispensed\":"  + String(countAtEvent) + ",";
-  payload += "\"timestamp\":\""      + getTimestamp()       + "\"";
+  payload += "\"timestamp\":\""      + timestamp            + "\"";
   payload += "}";
 
   Serial.println("Sending webhook: " + payload);
@@ -319,44 +440,88 @@ bool sendWebhook(long countAtEvent) {
   return success;
 }
 
+// Retry the oldest queued event with its original ID, count, and timestamp
+bool retryPendingWebhook() {
+  String rec = pendingQueue[0];
+  int p1 = rec.indexOf('|');
+  int p2 = rec.indexOf('|', p1 + 1);
+  if (p1 < 0 || p2 < 0) {
+    Serial.println("Corrupt pending record - discarding: " + rec);
+    dequeuePending();
+    return false;
+  }
+  String eventId   = rec.substring(0, p1);
+  long   count     = rec.substring(p1 + 1, p2).toInt();
+  String timestamp = rec.substring(p2 + 1);
+  return sendWebhook(eventId, count, timestamp);
+}
+
 // =====================
 // MAIN LOOP
 // =====================
 void loop() {
+  unsigned long now = millis();
 
-  // Reconnect WiFi if dropped
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi dropped - reconnecting...");
-    WiFi.reconnect();
-    delay(5000);
-  }
-
-  // Retry any pending failed webhooks
-  if (pendingRetries > 0 && WiFi.status() == WL_CONNECTED) {
-    Serial.print("Retrying pending webhook. Remaining: ");
-    Serial.println(pendingRetries);
-    if (sendWebhook(fillCount)) {
-      pendingRetries--;
-      prefs.putLong("pendingRetries", pendingRetries);
+  // ---- FILL SUPERVISION (highest priority - controls the valve) ----
+  if (filling) {
+    // Target reached → normal completion
+    if (pulseCount >= targetPulses) {
+      stopFill();
     }
-    delay(5000); // wait 5 sec between retries
+    // Hard time cap → sensor may have failed; never leave valve open
+    else if (now - fillStartMs > maxFillTimeMs) {
+      abortFill("Timeout");
+    }
+    // No pulses for too long → jug removed / supply dry / sensor fault
+    else if (pulseCount == lastFlowPulses && (now - lastFlowMs) > noFlowTimeoutMs) {
+      abortFill("No flow");
+    }
+    else {
+      if (pulseCount != lastFlowPulses) {
+        lastFlowPulses = pulseCount;
+        lastFlowMs     = now;
+      }
+      // Throttled LCD progress update
+      if (now - lastLcdMs >= lcdIntervalMs) {
+        lastLcdMs = now;
+        updateLCDFilling();
+      }
+    }
   }
 
-  // Button press → start fill (only if not already filling)
-  if (digitalRead(buttonPin) == LOW && !filling) {
+  // ---- BUTTON (edge-triggered: requires release between presses) ----
+  bool pressed = (digitalRead(buttonPin) == LOW);
+  if (pressed && buttonWasReleased) {
     delay(50); // debounce
     if (digitalRead(buttonPin) == LOW) {
-      startFill();
+      buttonWasReleased = false;
+      if (!filling) {
+        startFill();
+      } else {
+        abortFill("Canceled"); // press again mid-fill to cancel
+      }
     }
+  } else if (!pressed) {
+    buttonWasReleased = true;
   }
 
-  // Update LCD progress bar while filling
-  if (filling) {
-    updateLCDFilling();
-  }
+  // ---- NETWORK (only when idle, so it can never delay valve shutoff) ----
+  if (!filling) {
+    // Reconnect WiFi if dropped (non-blocking, rate-limited)
+    if (WiFi.status() != WL_CONNECTED && (now - lastWifiTryMs) >= wifiRetryIntervalMs) {
+      lastWifiTryMs = now;
+      Serial.println("WiFi dropped - reconnecting...");
+      WiFi.reconnect();
+    }
 
-  // Auto-stop when target volume reached
-  if (filling && pulseCount >= targetPulses) {
-    stopFill();
+    // Retry pending failed webhooks (rate-limited)
+    if (pendingCount > 0 && WiFi.status() == WL_CONNECTED && (now - lastRetryMs) >= retryIntervalMs) {
+      lastRetryMs = now;
+      Serial.print("Retrying pending webhook. Remaining: ");
+      Serial.println(pendingCount);
+      if (retryPendingWebhook()) {
+        dequeuePending();
+      }
+    }
   }
 }
