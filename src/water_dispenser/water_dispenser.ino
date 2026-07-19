@@ -254,7 +254,7 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     clickRelay(1);
-    delay(1500); // let DNS/TLS stack settle after WiFi connect
+    delay(3000); // let DNS/TLS stack settle after WiFi connect
     checkForFirmwareUpdate(); // check on every boot
   } else {
     clickRelay(2);
@@ -351,16 +351,18 @@ void setupLocalOTA() {
 // CLOUD OTA (GitHub-hosted, checked periodically)
 // =====================
 void checkForFirmwareUpdate() {
-  fota.setManifestURL(manifestUrl);
-  Serial.println("Checking manifest at: " + String(manifestUrl));
+  // Cache-buster avoids stale manifest from GitHub CDN after a push
+  String manifestCheckUrl = String(manifestUrl) + "?cb=" + String(millis());
+  fota.setManifestURL(manifestCheckUrl.c_str());
+  Serial.println("Checking manifest at: " + manifestCheckUrl);
   Serial.println("Device firmware version: " + FIRMWARE_VERSION);
 
   bool available = false;
-  for (int attempt = 1; attempt <= 3; attempt++) {
+  for (int attempt = 1; attempt <= 5; attempt++) {
     available = fota.execHTTPcheck();
     Serial.println("execHTTPcheck() attempt " + String(attempt) + " returned: " + String(available));
     if (available) break;
-    if (attempt < 3) delay(2000);
+    if (attempt < 5) delay(3000);
   }
 
   updateAvailable = available;
@@ -373,7 +375,7 @@ void checkForFirmwareUpdate() {
     showUpdatePrompt();
     clickRelay(2); // double-click = update available
   } else {
-    Serial.println("Firmware is up to date (or manifest check failed).");
+    Serial.println("No update found. If a newer manifest exists, the HTTPS check may have failed.");
   }
 }
 
