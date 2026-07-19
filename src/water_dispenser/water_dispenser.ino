@@ -27,6 +27,7 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <time.h>
+#include "esp_mac.h"
 
 // ==========================================================
 // FIRMWARE VERSION - bump this on every release
@@ -196,12 +197,13 @@ void setup() {
   lcd.setCursor(0, 1);
   lcd.print("v" + FIRMWARE_VERSION + " Starting.. ");
 
-  WiFi.mode(WIFI_STA);
-  String mac = WiFi.macAddress();
-  mac.replace(":", "");
-  String macSuffix = mac.substring(6);
+  uint8_t mac[6];
+  esp_efuse_mac_get_default(mac);
+  char macStr[7];
+  sprintf(macStr, "%02X%02X%02X", mac[3], mac[4], mac[5]);
+  String macSuffix = String(macStr);
   machineId   = "dispenser-" + macSuffix;
-  hotspotName = "WaterDispenser-" + macSuffix;
+  hotspotName = "WD-" + macSuffix;
   Serial.println("Machine ID: " + machineId);
   Serial.println("Firmware version: " + FIRMWARE_VERSION);
 
