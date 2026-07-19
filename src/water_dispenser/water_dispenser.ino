@@ -84,6 +84,8 @@ bool longPressHandled = false;
 // ---- FIRMWARE UPDATE STATE ----
 bool updateAvailable = false;
 String availableVersion = "";
+unsigned long updatePromptLastToggleMs = 0;
+bool updatePromptVisible = false;
 
 // ---- PERSISTENT STORAGE ----
 Preferences prefs;
@@ -106,7 +108,8 @@ String hotspotName;
 WebServer server(80);
 
 // ---- CLOUD OTA ----
-esp32FOTA fota("water-dispenser", FIRMWARE_VERSION.c_str());
+// 4th arg = allow_insecure_https: required for GitHub HTTPS (bundled CA often not linked)
+esp32FOTA fota("water-dispenser", FIRMWARE_VERSION.c_str(), false, true);
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
@@ -251,12 +254,15 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     clickRelay(1);
+    delay(1500); // let DNS/TLS stack settle after WiFi connect
     checkForFirmwareUpdate(); // check on every boot
   } else {
     clickRelay(2);
   }
 
-  updateLCDReady();
+  if (!updateAvailable) {
+    updateLCDReady();
+  }
   Serial.println("System ready.");
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("Local OTA: http://" + WiFi.localIP().toString() + "/update");
@@ -346,11 +352,17 @@ void setupLocalOTA() {
 // =====================
 void checkForFirmwareUpdate() {
   fota.setManifestURL(manifestUrl);
-  fota.useBundledCerts(true); // required for https:// GitHub URLs on ESP32 core 3.x
   Serial.println("Checking manifest at: " + String(manifestUrl));
   Serial.println("Device firmware version: " + FIRMWARE_VERSION);
-  bool available = fota.execHTTPcheck();
-  Serial.println("execHTTPcheck() returned: " + String(available));
+
+  bool available = false;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    available = fota.execHTTPcheck();
+    Serial.println("execHTTPcheck() attempt " + String(attempt) + " returned: " + String(available));
+    if (available) break;
+    if (attempt < 3) delay(2000);
+  }
+
   updateAvailable = available;
   lastUpdateCheckMs = millis();
   if (available) {
@@ -358,6 +370,8 @@ void checkForFirmwareUpdate() {
     fota.getPayloadVersion(remoteVersion);
     availableVersion = String(remoteVersion);
     Serial.println("Firmware update available on GitHub! Remote version: " + availableVersion);
+    showUpdatePrompt();
+    clickRelay(2); // double-click = update available
   } else {
     Serial.println("Firmware is up to date (or manifest check failed).");
   }
@@ -375,6 +389,15 @@ void performFirmwareUpdate() {
 // =====================
 // LCD
 // =====================
+void showUpdatePrompt() {
+  lcd.setCursor(0, 0);
+  lcd.print("Update ready!   ");
+  lcd.setCursor(0, 1);
+  lcd.print("Hold btn 3s     ");
+  updatePromptVisible = true;
+  updatePromptLastToggleMs = millis();
+}
+
 void updateLCDReady() {
   lcd.setCursor(0, 0);
   lcd.print("Press to fill   ");
@@ -703,18 +726,13 @@ void loop() {
 
     // Alternate LCD between ready screen and update prompt if available
     if (updateAvailable) {
-      static unsigned long lastPromptToggle = 0;
-      static bool showingPrompt = false;
-      if (now - lastPromptToggle > 4000) {
-        showingPrompt = !showingPrompt;
-        lastPromptToggle = now;
-        if (showingPrompt) {
-          lcd.setCursor(0, 0);
-          lcd.print("Update ready!   ");
-          lcd.setCursor(0, 1);
-          lcd.print("Hold btn 3s     ");
-        } else {
+      if (now - updatePromptLastToggleMs > 3000) {
+        updatePromptLastToggleMs = now;
+        if (updatePromptVisible) {
           updateLCDReady();
+          updatePromptVisible = false;
+        } else {
+          showUpdatePrompt();
         }
       }
     }
