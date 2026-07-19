@@ -23,6 +23,7 @@
 #include <WebServer.h>
 #include <ElegantOTA.h>
 #include <esp32FOTA.hpp>
+#include <ArduinoJson.h>
 #include <Preferences.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
@@ -84,6 +85,7 @@ bool longPressHandled = false;
 // ---- FIRMWARE UPDATE STATE ----
 bool updateAvailable = false;
 String availableVersion = "";
+String firmwareDownloadUrl = "";
 unsigned long updatePromptLastToggleMs = 0;
 bool updatePromptVisible = false;
 
@@ -350,17 +352,108 @@ void setupLocalOTA() {
 // =====================
 // CLOUD OTA (GitHub-hosted, checked periodically)
 // =====================
+bool fetchManifestUpdate() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("OTA: WiFi not connected");
+    return false;
+  }
+
+  HTTPClient http;
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(20000);
+
+  String url = String(manifestUrl) + "?cb=" + String(millis());
+  Serial.println("OTA: fetching " + url);
+
+  if (!http.begin(client, url)) {
+    Serial.println("OTA: http.begin() failed");
+    return false;
+  }
+
+  http.setTimeout(20000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  int httpCode = http.GET();
+  Serial.println("OTA: HTTP status " + String(httpCode));
+
+  if (httpCode != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+  Serial.println("OTA: manifest " + payload);
+
+  DynamicJsonDocument doc(2048);
+  if (deserializeJson(doc, payload)) {
+    Serial.println("OTA: JSON parse failed");
+    return false;
+  }
+
+  JsonVariant entry;
+  if (doc.is<JsonArray>()) {
+    bool found = false;
+    for (JsonVariant item : doc.as<JsonArray>()) {
+      const char* type = item["type"] | "";
+      if (strcmp(type, "water-dispenser") == 0) {
+        entry = item;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      Serial.println("OTA: type water-dispenser not found in manifest");
+      return false;
+    }
+  } else if (doc.is<JsonObject>()) {
+    entry = doc.as<JsonVariant>();
+    if (strcmp(entry["type"] | "", "water-dispenser") != 0) {
+      Serial.println("OTA: manifest type mismatch");
+      return false;
+    }
+  } else {
+    Serial.println("OTA: unexpected manifest format");
+    return false;
+  }
+
+  String remoteVer;
+  if (entry["version"].is<const char*>()) {
+    remoteVer = entry["version"].as<const char*>();
+  } else if (entry["version"].is<int>()) {
+    remoteVer = String(entry["version"].as<int>());
+  } else {
+    Serial.println("OTA: manifest missing version");
+    return false;
+  }
+
+  const char* binUrl = entry["url"] | "";
+  if (strlen(binUrl) == 0) {
+    Serial.println("OTA: manifest missing url");
+    return false;
+  }
+
+  SemverClass localVer(FIRMWARE_VERSION.c_str());
+  SemverClass remoteSem(remoteVer.c_str());
+  int cmp = semver_compare(*remoteSem.ver(), *localVer.ver());
+  Serial.println("OTA: remote=" + remoteVer + " local=" + FIRMWARE_VERSION + " compare=" + String(cmp));
+
+  if (cmp != 1) {
+    return false;
+  }
+
+  availableVersion = remoteVer;
+  firmwareDownloadUrl = binUrl;
+  return true;
+}
+
 void checkForFirmwareUpdate() {
-  // Cache-buster avoids stale manifest from GitHub CDN after a push
-  String manifestCheckUrl = String(manifestUrl) + "?cb=" + String(millis());
-  fota.setManifestURL(manifestCheckUrl.c_str());
-  Serial.println("Checking manifest at: " + manifestCheckUrl);
   Serial.println("Device firmware version: " + FIRMWARE_VERSION);
 
   bool available = false;
   for (int attempt = 1; attempt <= 5; attempt++) {
-    available = fota.execHTTPcheck();
-    Serial.println("execHTTPcheck() attempt " + String(attempt) + " returned: " + String(available));
+    available = fetchManifestUpdate();
+    Serial.println("manifest check attempt " + String(attempt) + " returned: " + String(available));
     if (available) break;
     if (attempt < 5) delay(3000);
   }
@@ -368,14 +461,11 @@ void checkForFirmwareUpdate() {
   updateAvailable = available;
   lastUpdateCheckMs = millis();
   if (available) {
-    char remoteVersion[32] = {};
-    fota.getPayloadVersion(remoteVersion);
-    availableVersion = String(remoteVersion);
-    Serial.println("Firmware update available on GitHub! Remote version: " + availableVersion);
+    Serial.println("Update available: " + availableVersion + " from " + firmwareDownloadUrl);
     showUpdatePrompt();
-    clickRelay(2); // double-click = update available
+    clickRelay(2);
   } else {
-    Serial.println("No update found. If a newer manifest exists, the HTTPS check may have failed.");
+    Serial.println("No update available.");
   }
 }
 
@@ -385,7 +475,13 @@ void performFirmwareUpdate() {
   lcd.setCursor(0, 1);
   lcd.print("Do not unplug!  ");
   Serial.println("Starting cloud OTA update...");
-  fota.execOTA(); // downloads, flashes, and reboots automatically
+  if (firmwareDownloadUrl.length() > 0) {
+    Serial.println("Downloading " + firmwareDownloadUrl);
+    fota.forceUpdate(firmwareDownloadUrl.c_str(), false);
+  } else {
+    fota.setManifestURL(manifestUrl);
+    fota.execOTA();
+  }
 }
 
 // =====================
@@ -718,6 +814,16 @@ void loop() {
       lastRetryMs = now;
       if (retryPendingWebhook()) {
         dequeuePending();
+      }
+    }
+
+    // Retry OTA check ~15s after boot if the first attempt during setup failed
+    static bool bootRecheckDone = false;
+    if (!bootRecheckDone && now > 15000 && WiFi.status() == WL_CONNECTED) {
+      bootRecheckDone = true;
+      if (!updateAvailable) {
+        Serial.println("Boot delayed OTA recheck...");
+        checkForFirmwareUpdate();
       }
     }
 
