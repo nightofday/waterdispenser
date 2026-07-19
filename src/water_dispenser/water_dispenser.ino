@@ -13,7 +13,7 @@
   - Local OTA updates (browser-based, same WiFi)
   - Cloud OTA updates (GitHub-hosted, checked every 6 hrs + on boot)
 
-  Current version: 1.0.3
+  Current version: 1.0.4
 */
 
 #include <WiFi.h>
@@ -33,7 +33,7 @@
 // ==========================================================
 // FIRMWARE VERSION - bump this on every release
 // ==========================================================
-const String FIRMWARE_VERSION = "1.0.3";
+const String FIRMWARE_VERSION = "1.0.4";
 
 // ==========================================================
 // CLOUD OTA CONFIG - update with your actual GitHub repo
@@ -51,6 +51,11 @@ float pulsesPerLiter = 374.0;
 const float targetGallons = 5.0;
 const float targetLiters  = targetGallons * 3.78541;
 long targetPulses;
+
+// ---- SOFT FINISH (pulse valve near end to cut average flow / splash) ----
+const float softFinishStartPct = 0.90;   // start soft fill at 90%
+const unsigned long softOpenMs  = 200;
+const unsigned long softCloseMs = 400;
 
 // ---- SAFETY LIMITS ----
 const unsigned long maxFillTimeMs   = 180000;
@@ -81,6 +86,11 @@ unsigned long lastUpdateCheckMs = 0;
 
 unsigned long buttonPressStart = 0;
 bool longPressHandled = false;
+
+// ---- SOFT FINISH STATE ----
+bool softFinishActive = false;
+unsigned long softPhaseStartMs = 0;
+bool softValveOpen = false;
 
 // ---- FIRMWARE UPDATE STATE ----
 bool updateAvailable = false;
@@ -517,7 +527,11 @@ void updateLCDReady() {
 
 void updateLCDFilling() {
   lcd.setCursor(0, 0);
-  lcd.print("Filling...      ");
+  if (softFinishActive) {
+    lcd.print("Slow finish...  ");
+  } else {
+    lcd.print("Filling...      ");
+  }
   lcd.setCursor(0, 1);
   int percent = (int)((pulseCount * 100) / targetPulses);
   if (percent > 100) percent = 100;
@@ -548,6 +562,32 @@ void showError(String msg) {
 // =====================
 // FILL CYCLE
 // =====================
+void clearSoftFinish() {
+  softFinishActive = false;
+  softPhaseStartMs = 0;
+  softValveOpen = false;
+}
+
+void startSoftFinish(unsigned long now) {
+  if (softFinishActive) return;
+  softFinishActive = true;
+  softValveOpen = true;
+  softPhaseStartMs = now;
+  digitalWrite(relayPin, HIGH);
+  Serial.println("Soft finish started (pulsed valve).");
+}
+
+void updateSoftFinishValve(unsigned long now) {
+  if (!softFinishActive) return;
+
+  unsigned long phaseMs = softValveOpen ? softOpenMs : softCloseMs;
+  if (now - softPhaseStartMs < phaseMs) return;
+
+  softValveOpen = !softValveOpen;
+  softPhaseStartMs = now;
+  digitalWrite(relayPin, softValveOpen ? HIGH : LOW);
+}
+
 void startFill() {
   pulseCount     = 0;
   state          = FILLING;
@@ -555,6 +595,7 @@ void startFill() {
   lastFlowPulses = 0;
   lastFlowMs     = millis();
   lastLcdMs      = 0;
+  clearSoftFinish();
   digitalWrite(relayPin, HIGH);
   Serial.println("Fill started.");
 }
@@ -562,6 +603,7 @@ void startFill() {
 void pauseFill() {
   state = PAUSED;
   pauseStartMs = millis();
+  clearSoftFinish();
   digitalWrite(relayPin, LOW);
   Serial.println("Fill paused at " + String(pulseCount) + " pulses.");
   updateLCDPaused();
@@ -571,12 +613,20 @@ void resumeFill() {
   state = FILLING;
   lastFlowPulses = pulseCount;
   lastFlowMs = millis();
-  digitalWrite(relayPin, HIGH);
+  clearSoftFinish();
+  // Re-enter soft finish immediately if already past the soft-start threshold
+  long softStartPulses = (long)(targetPulses * softFinishStartPct);
+  if (pulseCount >= softStartPulses) {
+    startSoftFinish(millis());
+  } else {
+    digitalWrite(relayPin, HIGH);
+  }
   Serial.println("Fill resumed.");
 }
 
 void abortFill(const char* reason) {
   state = IDLE;
+  clearSoftFinish();
   digitalWrite(relayPin, LOW);
   Serial.print("Fill aborted: ");
   Serial.println(reason);
@@ -587,6 +637,7 @@ void abortFill(const char* reason) {
 
 void stopFill() {
   state = IDLE;
+  clearSoftFinish();
   digitalWrite(relayPin, LOW);
 
   totalFillCount++;
@@ -748,6 +799,16 @@ void loop() {
       abortFill("No flow");
     }
     else {
+      long softStartPulses = (long)(targetPulses * softFinishStartPct);
+      if (pulseCount >= softStartPulses) {
+        startSoftFinish(now);
+        updateSoftFinishValve(now);
+        // Valve is intentionally closed during soft-finish off-phase; don't trip no-flow
+        if (softFinishActive && !softValveOpen) {
+          lastFlowMs = now;
+        }
+      }
+
       if (pulseCount != lastFlowPulses) {
         lastFlowPulses = pulseCount;
         lastFlowMs     = now;
