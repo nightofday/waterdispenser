@@ -13,7 +13,7 @@
   - Local OTA updates (browser-based, same WiFi)
   - Cloud OTA updates (GitHub-hosted, checked every 6 hrs + on boot)
 
-  Current version: 1.0.6
+  Current version: 1.0.7
 */
 
 #include <WiFi.h>
@@ -33,7 +33,7 @@
 // ==========================================================
 // FIRMWARE VERSION - bump this on every release
 // ==========================================================
-const String FIRMWARE_VERSION = "1.0.6";
+const String FIRMWARE_VERSION = "1.0.7";
 
 // ==========================================================
 // CLOUD OTA CONFIG - update with your actual GitHub repo
@@ -554,11 +554,8 @@ void updateLCDPaused() {
   lcd.setCursor(0, 0);
   lcd.print("PAUSED          ");
   lcd.setCursor(0, 1);
-  int percent = (int)((pulseCount * 100) / targetPulses);
-  if (percent > 100) percent = 100;
-  lcd.print("At ");
-  lcd.print(percent);
-  lcd.print("% - press btn ");
+  // Tap=resume, hold 3s=cancel (no fill count)
+  lcd.print("Tap=go Hold=stop ");
 }
 
 void showError(String msg) {
@@ -1017,8 +1014,13 @@ void loop() {
   }
 
   if (pressed && !buttonWasReleased && !longPressHandled) {
+    // Hold 3s while paused: cancel fill (no jug count / no webhook)
+    if (state == PAUSED && (now - buttonPressStart >= 3000)) {
+      longPressHandled = true;
+      abortFill("Cancelled");
+    }
     // If a firmware update is available, a 3-second hold triggers it
-    if (updateAvailable && state == IDLE && (now - buttonPressStart >= 3000)) {
+    else if (updateAvailable && state == IDLE && (now - buttonPressStart >= 3000)) {
       longPressHandled = true;
       performFirmwareUpdate();
     }
