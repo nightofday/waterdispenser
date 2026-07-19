@@ -13,7 +13,7 @@
   - Local OTA updates (browser-based, same WiFi)
   - Cloud OTA updates (GitHub-hosted, checked every 6 hrs + on boot)
 
-  Current version: 1.0.2
+  Current version: 1.0.3
 */
 
 #include <WiFi.h>
@@ -32,7 +32,7 @@
 // ==========================================================
 // FIRMWARE VERSION - bump this on every release
 // ==========================================================
-const String FIRMWARE_VERSION = "1.0.2";
+const String FIRMWARE_VERSION = "1.0.3";
 
 // ==========================================================
 // CLOUD OTA CONFIG - update with your actual GitHub repo
@@ -196,9 +196,9 @@ void setup() {
   lcd.init();
   lcd.backlight();
   lcd.setCursor(0, 0);
-  lcd.print("WD v" + FIRMWARE_VERSION + " OTA  ");
+  lcd.print("Cloud OTA v" + FIRMWARE_VERSION);
   lcd.setCursor(0, 1);
-  lcd.print("Booting up...   ");
+  lcd.print("Test #2 ready!  ");
 
   uint8_t mac[6];
   esp_efuse_mac_get_default(mac);
