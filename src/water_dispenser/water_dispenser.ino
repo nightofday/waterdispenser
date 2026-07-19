@@ -13,7 +13,7 @@
   - Local OTA updates (browser-based, same WiFi)
   - Cloud OTA updates (GitHub-hosted, checked every 6 hrs + on boot)
 
-  Current version: 1.0.0
+  Current version: 1.0.1
 */
 
 #include <WiFi.h>
@@ -346,13 +346,20 @@ void setupLocalOTA() {
 // =====================
 void checkForFirmwareUpdate() {
   fota.setManifestURL(manifestUrl);
+  fota.useBundledCerts(true); // required for https:// GitHub URLs on ESP32 core 3.x
+  Serial.println("Checking manifest at: " + String(manifestUrl));
+  Serial.println("Device firmware version: " + FIRMWARE_VERSION);
   bool available = fota.execHTTPcheck();
+  Serial.println("execHTTPcheck() returned: " + String(available));
   updateAvailable = available;
   lastUpdateCheckMs = millis();
   if (available) {
-    Serial.println("Firmware update available on GitHub!");
+    char remoteVersion[32] = {};
+    fota.getPayloadVersion(remoteVersion);
+    availableVersion = String(remoteVersion);
+    Serial.println("Firmware update available on GitHub! Remote version: " + availableVersion);
   } else {
-    Serial.println("Firmware is up to date.");
+    Serial.println("Firmware is up to date (or manifest check failed).");
   }
 }
 
