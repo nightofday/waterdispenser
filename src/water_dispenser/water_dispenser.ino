@@ -6,14 +6,14 @@
   - Flow sensor calibrated volume dispensing
   - Solenoid valve control via relay
   - LCD status display
-  - WiFi provisioning via captive portal (WiFiManager)
+  - WiFi provisioning via captive portal (WiFiManager; hold fill button 5s)
   - POS webhook integration with retry queue and dedup
   - Pause/Resume mid-fill
   - Daily + lifetime fill counters
   - Local OTA updates (browser-based, same WiFi)
   - Cloud OTA updates (GitHub-hosted, checked every 6 hrs + on boot)
 
-  Current version: 1.0.5
+  Current version: 1.0.6
 */
 
 #include <WiFi.h>
@@ -33,7 +33,7 @@
 // ==========================================================
 // FIRMWARE VERSION - bump this on every release
 // ==========================================================
-const String FIRMWARE_VERSION = "1.0.5";
+const String FIRMWARE_VERSION = "1.0.6";
 
 // ==========================================================
 // CLOUD OTA CONFIG - update with your actual GitHub repo
@@ -852,7 +852,21 @@ void runJugCalibration() {
   }
 }
 
-// Hold 5s enters this menu: short press = jug cal, hold 2s = 1L cal
+// Clears WiFi only (keeps fill counts / calibration). Opens captive portal on reboot.
+void startWifiConfig() {
+  digitalWrite(relayPin, LOW);
+  lcd.setCursor(0, 0);
+  lcd.print("WiFi setup...   ");
+  lcd.setCursor(0, 1);
+  lcd.print("Connect to AP   ");
+  Serial.println("Button WiFi config: clearing WiFi credentials (prefs kept).");
+  WiFiManager wm;
+  wm.resetSettings();
+  delay(1500);
+  ESP.restart();
+}
+
+// Hold 5s -> this menu: short press = jug cal, hold 2s = 1L cal
 void runCalibrationMenu() {
   lcd.setCursor(0, 0);
   lcd.print("Cal: JUG fill   ");
@@ -868,7 +882,6 @@ void runCalibrationMenu() {
     server.handleClient();
     ElegantOTA.loop();
 
-    // Auto-start jug cal after 15s of no choice
     if (millis() - menuStart > 15000) {
       runJugCalibration();
       return;
@@ -888,8 +901,49 @@ void runCalibrationMenu() {
           return;
         }
       }
-      // Short tap
       runJugCalibration();
+      return;
+    }
+  }
+}
+
+// Hold 5s on fill button (IDLE): WiFi setup or calibration — no need to open the enclosure
+void runHoldMenu() {
+  lcd.setCursor(0, 0);
+  lcd.print("WiFi setup?     ");
+  lcd.setCursor(0, 1);
+  lcd.print("Tap=WiFi Hold=Cal");
+  Serial.println("Hold menu: short press = WiFi setup, hold 2s = calibration.");
+
+  while (digitalRead(buttonPin) == LOW) delay(10);
+  delay(200);
+
+  unsigned long menuStart = millis();
+  while (true) {
+    server.handleClient();
+    ElegantOTA.loop();
+
+    // Default to WiFi setup if no choice (matches "button = WiFi config" expectation)
+    if (millis() - menuStart > 15000) {
+      startWifiConfig();
+      return;
+    }
+
+    if (digitalRead(buttonPin) == LOW) {
+      delay(50);
+      if (digitalRead(buttonPin) != LOW) continue;
+
+      unsigned long pressAt = millis();
+      while (digitalRead(buttonPin) == LOW) {
+        server.handleClient();
+        ElegantOTA.loop();
+        if (millis() - pressAt >= 2000) {
+          while (digitalRead(buttonPin) == LOW) delay(10);
+          runCalibrationMenu();
+          return;
+        }
+      }
+      startWifiConfig();
       return;
     }
   }
@@ -968,13 +1022,10 @@ void loop() {
       longPressHandled = true;
       performFirmwareUpdate();
     }
-    // Otherwise, a 5-second hold enters calibration mode
+    // 5-second hold: WiFi setup (external button) or calibration
     else if (!updateAvailable && state == IDLE && (now - buttonPressStart >= 5000)) {
       longPressHandled = true;
-      lcd.setCursor(0, 0);
-      lcd.print("Entering Cal... ");
-      delay(400);
-      runCalibrationMenu();
+      runHoldMenu();
     }
   }
 
