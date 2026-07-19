@@ -32,7 +32,7 @@
 // ==========================================================
 // FIRMWARE VERSION - bump this on every release
 // ==========================================================
-const String FIRMWARE_VERSION = "1.0.0";
+const String FIRMWARE_VERSION = "1.0.1";
 
 // ==========================================================
 // CLOUD OTA CONFIG - update with your actual GitHub repo
