@@ -13,7 +13,7 @@
   - Local OTA updates (browser-based, same WiFi)
   - Cloud OTA updates (GitHub-hosted, checked every 6 hrs + on boot)
 
-  Current version: 1.0.4
+  Current version: 1.0.5
 */
 
 #include <WiFi.h>
@@ -33,7 +33,7 @@
 // ==========================================================
 // FIRMWARE VERSION - bump this on every release
 // ==========================================================
-const String FIRMWARE_VERSION = "1.0.4";
+const String FIRMWARE_VERSION = "1.0.5";
 
 // ==========================================================
 // CLOUD OTA CONFIG - update with your actual GitHub repo
@@ -56,10 +56,13 @@ long targetPulses;
 const float softFinishStartPct = 0.90;   // start soft fill at 90%
 const unsigned long softOpenMs  = 200;
 const unsigned long softCloseMs = 400;
+// If average flow is already slow (multi-faucet / low pressure), skip pulsing
+const float softFinishMinPulseRate = 20.0; // pulses/sec; below this = keep valve open
 
 // ---- SAFETY LIMITS ----
-const unsigned long maxFillTimeMs   = 180000;
-const unsigned long noFlowTimeoutMs = 10000;
+// Longer limits tolerate low pressure when other faucets are open
+const unsigned long maxFillTimeMs   = 300000; // 5 minutes
+const unsigned long noFlowTimeoutMs = 20000;  // 20s (slow drip still counts as flow)
 const unsigned long pauseTimeoutMs  = 120000;
 
 // ---- NON-BLOCKING TIMERS ----
@@ -229,22 +232,29 @@ void setup() {
   pinMode(flowSensorPin, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(flowSensorPin), countPulse, FALLING);
 
-  targetPulses = (long)(targetLiters * pulsesPerLiter);
-
   prefs.begin("waterstation", false);
   totalFillCount = prefs.getLong("fillCount", 0);
   todayFillCount = prefs.getLong("todayCount", 0);
   todayDateStr   = prefs.getString("todayDate", "");
   lastEventId    = prefs.getULong("lastEventId", 0);
   pulsesPerLiter = prefs.getFloat("pulsesPerL", 374.0);
+  long savedTarget = prefs.getLong("targetPulses", 0);
   String savedUrl = prefs.getString("webhookUrl", "");
   savedUrl.toCharArray(webhookUrl, 200);
   loadPendingQueue();
 
-  targetPulses = (long)(targetLiters * pulsesPerLiter);
+  // Prefer jug-calibrated target if present; else derive from 1L factor
+  if (savedTarget > 100) {
+    targetPulses = savedTarget;
+    pulsesPerLiter = (float)targetPulses / targetLiters;
+  } else {
+    targetPulses = (long)(targetLiters * pulsesPerLiter);
+  }
 
   Serial.print("Loaded total: ");
   Serial.println(totalFillCount);
+  Serial.print("Target pulses: ");
+  Serial.println(targetPulses);
   Serial.print("Pending webhooks: ");
   Serial.println(pendingCount);
 
@@ -728,8 +738,33 @@ bool retryPendingWebhook() {
 // =====================
 // CALIBRATION MODE
 // =====================
-void runCalibration() {
+void saveFillTarget(long measuredPulses) {
+  targetPulses = measuredPulses;
+  pulsesPerLiter = (float)targetPulses / targetLiters;
+  prefs.putLong("targetPulses", targetPulses);
+  prefs.putFloat("pulsesPerL", pulsesPerLiter);
+  Serial.print("Saved targetPulses: ");
+  Serial.println(targetPulses);
+  Serial.print("Derived pulsesPerLiter: ");
+  Serial.println(pulsesPerLiter);
+}
+
+void finishCalibrationUi(bool ok, const char* line2) {
+  lcd.setCursor(0, 0);
+  lcd.print(ok ? "Cal saved!      " : "Cal failed!     ");
+  lcd.setCursor(0, 1);
+  String msg = String(line2) + "                ";
+  lcd.print(msg.substring(0, 16));
+  delay(3000);
+  updateLCDReady();
+  while (digitalRead(buttonPin) == LOW) delay(10);
+  buttonWasReleased = true;
+}
+
+// 1L pour: good for sensor factor; jug fill uses targetLiters * factor
+void runOneLiterCalibration() {
   pulseCount = 0;
+  digitalWrite(relayPin, LOW);
   lcd.setCursor(0, 0);
   lcd.print("Cal: Pour 1L    ");
   lcd.setCursor(0, 1);
@@ -740,6 +775,8 @@ void runCalibration() {
   delay(300);
 
   while (true) {
+    server.handleClient();
+    ElegantOTA.loop();
     lcd.setCursor(0, 1);
     lcd.print("Pulses:");
     lcd.print(pulseCount);
@@ -756,25 +793,106 @@ void runCalibration() {
     pulsesPerLiter = (float)measuredPulses;
     targetPulses = (long)(targetLiters * pulsesPerLiter);
     prefs.putFloat("pulsesPerL", pulsesPerLiter);
-
-    lcd.setCursor(0, 0);
-    lcd.print("Cal saved!      ");
-    lcd.setCursor(0, 1);
-    lcd.print(pulsesPerLiter);
-    lcd.print(" p/L      ");
-    Serial.print("New pulsesPerLiter: ");
-    Serial.println(pulsesPerLiter);
+    prefs.putLong("targetPulses", targetPulses);
+    char buf[17];
+    snprintf(buf, sizeof(buf), "%.0f p/L", pulsesPerLiter);
+    finishCalibrationUi(true, buf);
   } else {
-    lcd.setCursor(0, 0);
-    lcd.print("Cal failed!     ");
+    finishCalibrationUi(false, "Too few pulses");
+  }
+}
+
+// Real jug: valve opens, user presses when jug is full (match typical faucet load)
+void runJugCalibration() {
+  pulseCount = 0;
+  clearSoftFinish();
+  digitalWrite(relayPin, HIGH);
+  lcd.setCursor(0, 0);
+  lcd.print("Cal: Fill jug   ");
+  lcd.setCursor(0, 1);
+  lcd.print("Press when FULL ");
+  Serial.println("Jug calibration: filling. Press when jug is full.");
+  Serial.println("Tip: use your typical faucet load (e.g. other taps as usual).");
+
+  while (digitalRead(buttonPin) == LOW) delay(10);
+  delay(300);
+
+  unsigned long started = millis();
+  while (true) {
+    server.handleClient();
+    ElegantOTA.loop();
+
     lcd.setCursor(0, 1);
-    lcd.print("Too few pulses  ");
+    lcd.print("Pulses:");
+    lcd.print(pulseCount);
+    lcd.print("      ");
+
+    if (digitalRead(buttonPin) == LOW) {
+      delay(50);
+      if (digitalRead(buttonPin) == LOW) break;
+    }
+
+    // Safety: abort if somehow left running too long
+    if (millis() - started > maxFillTimeMs) {
+      digitalWrite(relayPin, LOW);
+      finishCalibrationUi(false, "Timeout");
+      return;
+    }
   }
 
-  delay(3000);
-  updateLCDReady();
+  digitalWrite(relayPin, LOW);
+  long measuredPulses = pulseCount;
+  if (measuredPulses > 200) {
+    saveFillTarget(measuredPulses);
+    char buf[17];
+    snprintf(buf, sizeof(buf), "%ld pulses", measuredPulses);
+    finishCalibrationUi(true, buf);
+  } else {
+    finishCalibrationUi(false, "Too few pulses");
+  }
+}
+
+// Hold 5s enters this menu: short press = jug cal, hold 2s = 1L cal
+void runCalibrationMenu() {
+  lcd.setCursor(0, 0);
+  lcd.print("Cal: JUG fill   ");
+  lcd.setCursor(0, 1);
+  lcd.print("Tap=jug Hold=1L ");
+  Serial.println("Calibration menu: short press = jug, hold 2s = 1L.");
+
   while (digitalRead(buttonPin) == LOW) delay(10);
-  buttonWasReleased = true;
+  delay(200);
+
+  unsigned long menuStart = millis();
+  while (true) {
+    server.handleClient();
+    ElegantOTA.loop();
+
+    // Auto-start jug cal after 15s of no choice
+    if (millis() - menuStart > 15000) {
+      runJugCalibration();
+      return;
+    }
+
+    if (digitalRead(buttonPin) == LOW) {
+      delay(50);
+      if (digitalRead(buttonPin) != LOW) continue;
+
+      unsigned long pressAt = millis();
+      while (digitalRead(buttonPin) == LOW) {
+        server.handleClient();
+        ElegantOTA.loop();
+        if (millis() - pressAt >= 2000) {
+          while (digitalRead(buttonPin) == LOW) delay(10);
+          runOneLiterCalibration();
+          return;
+        }
+      }
+      // Short tap
+      runJugCalibration();
+      return;
+    }
+  }
 }
 
 // =====================
@@ -801,11 +919,18 @@ void loop() {
     else {
       long softStartPulses = (long)(targetPulses * softFinishStartPct);
       if (pulseCount >= softStartPulses) {
-        startSoftFinish(now);
-        updateSoftFinishValve(now);
-        // Valve is intentionally closed during soft-finish off-phase; don't trip no-flow
-        if (softFinishActive && !softValveOpen) {
-          lastFlowMs = now;
+        // Soft-finish is for high pressure splash. If flow is already slow
+        // (other faucets open / low pressure), keep the valve fully open.
+        unsigned long elapsed = now - fillStartMs;
+        float pulseRate = (elapsed > 0) ? ((float)pulseCount * 1000.0f / (float)elapsed) : 0.0f;
+        if (pulseRate >= softFinishMinPulseRate) {
+          startSoftFinish(now);
+          updateSoftFinishValve(now);
+          if (softFinishActive && !softValveOpen) {
+            lastFlowMs = now;
+          }
+        } else if (!softFinishActive) {
+          digitalWrite(relayPin, HIGH);
         }
       }
 
@@ -849,7 +974,7 @@ void loop() {
       lcd.setCursor(0, 0);
       lcd.print("Entering Cal... ");
       delay(400);
-      runCalibration();
+      runCalibrationMenu();
     }
   }
 
