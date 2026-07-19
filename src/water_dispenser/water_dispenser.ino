@@ -198,9 +198,9 @@ void setup() {
   lcd.init();
   lcd.backlight();
   lcd.setCursor(0, 0);
-  lcd.print("Cloud OTA v" + FIRMWARE_VERSION);
+  lcd.print("Water Dispenser ");
   lcd.setCursor(0, 1);
-  lcd.print("Test #2 ready!  ");
+  lcd.print("v" + FIRMWARE_VERSION + " Starting.. ");
 
   uint8_t mac[6];
   esp_efuse_mac_get_default(mac);
@@ -257,7 +257,7 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     clickRelay(1);
     delay(3000); // let DNS/TLS stack settle after WiFi connect
-    checkForFirmwareUpdate(); // check on every boot
+    checkForFirmwareUpdate(3); // check on every boot (retry a few times)
   } else {
     clickRelay(2);
   }
@@ -361,7 +361,6 @@ bool fetchManifestUpdate() {
   HTTPClient http;
   WiFiClientSecure client;
   client.setInsecure();
-  client.setTimeout(20000);
 
   String url = String(manifestUrl) + "?cb=" + String(millis());
   Serial.println("OTA: fetching " + url);
@@ -371,7 +370,7 @@ bool fetchManifestUpdate() {
     return false;
   }
 
-  http.setTimeout(20000);
+  http.setTimeout(10000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   int httpCode = http.GET();
   Serial.println("OTA: HTTP status " + String(httpCode));
@@ -447,15 +446,15 @@ bool fetchManifestUpdate() {
   return true;
 }
 
-void checkForFirmwareUpdate() {
+void checkForFirmwareUpdate(int maxAttempts) {
   Serial.println("Device firmware version: " + FIRMWARE_VERSION);
 
   bool available = false;
-  for (int attempt = 1; attempt <= 5; attempt++) {
+  for (int attempt = 1; attempt <= maxAttempts; attempt++) {
     available = fetchManifestUpdate();
     Serial.println("manifest check attempt " + String(attempt) + " returned: " + String(available));
     if (available) break;
-    if (attempt < 5) delay(3000);
+    if (attempt < maxAttempts) delay(2000);
   }
 
   updateAvailable = available;
@@ -470,18 +469,27 @@ void checkForFirmwareUpdate() {
 }
 
 void performFirmwareUpdate() {
+  if (firmwareDownloadUrl.length() == 0) {
+    Serial.println("OTA: no firmware URL, aborting update.");
+    return;
+  }
+
   lcd.setCursor(0, 0);
   lcd.print("Updating...     ");
   lcd.setCursor(0, 1);
   lcd.print("Do not unplug!  ");
   Serial.println("Starting cloud OTA update...");
-  if (firmwareDownloadUrl.length() > 0) {
-    Serial.println("Downloading " + firmwareDownloadUrl);
-    fota.forceUpdate(firmwareDownloadUrl.c_str(), false);
-  } else {
-    fota.setManifestURL(manifestUrl);
-    fota.execOTA();
-  }
+  Serial.println("Downloading " + firmwareDownloadUrl);
+
+  // On success, execOTA() flashes and reboots (never returns).
+  // If it returns, the update failed - report and recover.
+  fota.forceUpdate(firmwareDownloadUrl.c_str(), false);
+
+  Serial.println("OTA: update failed.");
+  showError("Update failed");
+  delay(3000);
+  updatePromptLastToggleMs = 0; // resume update prompt on next loop tick
+  updatePromptVisible = false;
 }
 
 // =====================
@@ -823,13 +831,13 @@ void loop() {
       bootRecheckDone = true;
       if (!updateAvailable) {
         Serial.println("Boot delayed OTA recheck...");
-        checkForFirmwareUpdate();
+        checkForFirmwareUpdate(3);
       }
     }
 
-    // Periodic cloud firmware check every 6 hours
+    // Periodic cloud firmware check every 6 hours (single attempt to avoid UI freeze)
     if (now - lastUpdateCheckMs >= updateCheckIntervalMs && WiFi.status() == WL_CONNECTED) {
-      checkForFirmwareUpdate();
+      checkForFirmwareUpdate(1);
     }
 
     // Alternate LCD between ready screen and update prompt if available
