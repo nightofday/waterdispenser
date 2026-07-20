@@ -13,7 +13,7 @@
   - Local OTA updates (browser-based, same WiFi)
   - Cloud OTA updates (GitHub-hosted, checked every 6 hrs + on boot)
 
-  Current version: 1.0.7
+  Current version: 1.0.8
 */
 
 #include <WiFi.h>
@@ -33,7 +33,7 @@
 // ==========================================================
 // FIRMWARE VERSION - bump this on every release
 // ==========================================================
-const String FIRMWARE_VERSION = "1.0.7";
+const String FIRMWARE_VERSION = "1.0.8";
 
 // ==========================================================
 // CLOUD OTA CONFIG - update with your actual GitHub repo
@@ -206,6 +206,10 @@ void checkDailyReset() {
 // SETUP
 // =====================
 void setup() {
+  // Solenoid first — hold closed before anything else can glitch GPIO on boot
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, LOW);
+
   Serial.begin(115200);
 
   lcd.init();
@@ -227,8 +231,6 @@ void setup() {
 
   pinMode(buttonPin,     INPUT_PULLUP);
   pinMode(resetPin,      INPUT_PULLUP);
-  pinMode(relayPin,      OUTPUT);
-  digitalWrite(relayPin, LOW);
   pinMode(flowSensorPin, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(flowSensorPin), countPulse, FALLING);
 
@@ -275,11 +277,8 @@ void setup() {
   setupLocalOTA();
 
   if (WiFi.status() == WL_CONNECTED) {
-    clickRelay(1);
     delay(3000); // let DNS/TLS stack settle after WiFi connect
     checkForFirmwareUpdate(3); // check on every boot (retry a few times)
-  } else {
-    clickRelay(2);
   }
 
   if (!updateAvailable) {
@@ -288,18 +287,6 @@ void setup() {
   Serial.println("System ready.");
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("Local OTA: http://" + WiFi.localIP().toString() + "/update");
-  }
-}
-
-// =====================
-// RELAY CLICK SIGNAL (audible alerts)
-// =====================
-void clickRelay(int times) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(relayPin, HIGH);
-    delay(120);
-    digitalWrite(relayPin, LOW);
-    delay(150);
   }
 }
 
@@ -482,7 +469,6 @@ void checkForFirmwareUpdate(int maxAttempts) {
   if (available) {
     Serial.println("Update available: " + availableVersion + " from " + firmwareDownloadUrl);
     showUpdatePrompt();
-    clickRelay(2);
   } else {
     Serial.println("No update available.");
   }
@@ -664,8 +650,6 @@ void stopFill() {
     enqueuePending(eventId, totalFillCount, timestamp);
     Serial.println("Webhook failed - queued for retry.");
   }
-
-  clickRelay(3); // fill complete alert
 
   lcd.setCursor(0, 0);
   lcd.print("Done! Jug #");
@@ -964,24 +948,31 @@ void loop() {
     else if (now - fillStartMs > maxFillTimeMs) {
       abortFill("Timeout");
     }
-    else if (pulseCount == lastFlowPulses && (now - lastFlowMs) > noFlowTimeoutMs) {
+    else if (!softFinishActive &&
+             pulseCount == lastFlowPulses &&
+             (now - lastFlowMs) > noFlowTimeoutMs) {
       abortFill("No flow");
     }
     else {
       long softStartPulses = (long)(targetPulses * softFinishStartPct);
       if (pulseCount >= softStartPulses) {
-        // Soft-finish is for high pressure splash. If flow is already slow
-        // (other faucets open / low pressure), keep the valve fully open.
-        unsigned long elapsed = now - fillStartMs;
-        float pulseRate = (elapsed > 0) ? ((float)pulseCount * 1000.0f / (float)elapsed) : 0.0f;
-        if (pulseRate >= softFinishMinPulseRate) {
-          startSoftFinish(now);
+        if (softFinishActive) {
+          // Keep pulsing until target — never gate maintenance on average pulse rate
+          // (pulsing itself lowers the average and used to freeze the valve closed).
           updateSoftFinishValve(now);
-          if (softFinishActive && !softValveOpen) {
+          if (!softValveOpen) {
             lastFlowMs = now;
           }
-        } else if (!softFinishActive) {
-          digitalWrite(relayPin, HIGH);
+        } else {
+          // Soft-finish is for high pressure splash. If flow is already slow
+          // (other faucets open / low pressure), keep the valve fully open.
+          unsigned long elapsed = now - fillStartMs;
+          float pulseRate = (elapsed > 0) ? ((float)pulseCount * 1000.0f / (float)elapsed) : 0.0f;
+          if (pulseRate >= softFinishMinPulseRate) {
+            startSoftFinish(now);
+          } else {
+            digitalWrite(relayPin, HIGH);
+          }
         }
       }
 
