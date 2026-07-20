@@ -13,7 +13,7 @@
   - Local OTA updates (browser-based, same WiFi)
   - Cloud OTA updates (GitHub-hosted, checked every 6 hrs + on boot)
 
-  Current version: 1.0.8
+  Current version: 1.0.10
 */
 
 #include <WiFi.h>
@@ -33,7 +33,7 @@
 // ==========================================================
 // FIRMWARE VERSION - bump this on every release
 // ==========================================================
-const String FIRMWARE_VERSION = "1.0.8";
+const String FIRMWARE_VERSION = "1.0.10";
 
 // ==========================================================
 // CLOUD OTA CONFIG - update with your actual GitHub repo
@@ -52,12 +52,13 @@ const float targetGallons = 5.0;
 const float targetLiters  = targetGallons * 3.78541;
 long targetPulses;
 
-// ---- SOFT FINISH (pulse valve near end to cut average flow / splash) ----
-const float softFinishStartPct = 0.90;   // start soft fill at 90%
-const unsigned long softOpenMs  = 200;
-const unsigned long softCloseMs = 400;
-// If average flow is already slow (multi-faucet / low pressure), skip pulsing
-const float softFinishMinPulseRate = 20.0; // pulses/sec; below this = keep valve open
+// ---- SMOOTH FINISH (single anticipatory close; no valve pulsing) ----
+// Close the valve slightly early when flow is fast; water still in the hose
+// coasts into the jug. Low pressure (other taps open) fills to full target.
+const float coastZoneStartPct   = 0.85;  // only apply in the last 15%
+const float coastTimeSec        = 0.45f; // estimated hose drain after valve closes
+const float coastMinPulseRate   = 12.0f; // pulses/sec; below = no early stop
+const int   coastPulseCapPct    = 8;     // never stop more than 8% early
 
 // ---- SAFETY LIMITS ----
 // Longer limits tolerate low pressure when other faucets are open
@@ -82,6 +83,9 @@ unsigned long fillStartMs    = 0;
 unsigned long pauseStartMs   = 0;
 long          lastFlowPulses = 0;
 unsigned long lastFlowMs     = 0;
+long          rateSamplePulses = 0;
+unsigned long rateSampleMs   = 0;
+float         recentPulseRate = 0.0f;
 unsigned long lastLcdMs      = 0;
 unsigned long lastRetryMs    = 0;
 unsigned long lastWifiTryMs  = 0;
@@ -89,11 +93,6 @@ unsigned long lastUpdateCheckMs = 0;
 
 unsigned long buttonPressStart = 0;
 bool longPressHandled = false;
-
-// ---- SOFT FINISH STATE ----
-bool softFinishActive = false;
-unsigned long softPhaseStartMs = 0;
-bool softValveOpen = false;
 
 // ---- FIRMWARE UPDATE STATE ----
 bool updateAvailable = false;
@@ -523,11 +522,7 @@ void updateLCDReady() {
 
 void updateLCDFilling() {
   lcd.setCursor(0, 0);
-  if (softFinishActive) {
-    lcd.print("Slow finish...  ");
-  } else {
-    lcd.print("Filling...      ");
-  }
+  lcd.print("Filling...      ");
   lcd.setCursor(0, 1);
   int percent = (int)((pulseCount * 100) / targetPulses);
   if (percent > 100) percent = 100;
@@ -555,30 +550,35 @@ void showError(String msg) {
 // =====================
 // FILL CYCLE
 // =====================
-void clearSoftFinish() {
-  softFinishActive = false;
-  softPhaseStartMs = 0;
-  softValveOpen = false;
+void resetPulseRateSample(unsigned long now) {
+  rateSamplePulses = pulseCount;
+  rateSampleMs     = now;
+  recentPulseRate  = 0.0f;
 }
 
-void startSoftFinish(unsigned long now) {
-  if (softFinishActive) return;
-  softFinishActive = true;
-  softValveOpen = true;
-  softPhaseStartMs = now;
-  digitalWrite(relayPin, HIGH);
-  Serial.println("Soft finish started (pulsed valve).");
+void updateRecentPulseRate(unsigned long now) {
+  unsigned long elapsed = now - rateSampleMs;
+  if (elapsed < 400) return;
+
+  long delta = pulseCount - rateSamplePulses;
+  recentPulseRate = (float)delta * 1000.0f / (float)elapsed;
+  rateSamplePulses = pulseCount;
+  rateSampleMs = now;
 }
 
-void updateSoftFinishValve(unsigned long now) {
-  if (!softFinishActive) return;
+// One clean valve close before target when pressure is high; smooth, no pulsing.
+long getFillStopPulses() {
+  long zoneStart = (long)(targetPulses * coastZoneStartPct);
+  if (pulseCount < zoneStart) return targetPulses;
+  if (recentPulseRate < coastMinPulseRate) return targetPulses;
 
-  unsigned long phaseMs = softValveOpen ? softOpenMs : softCloseMs;
-  if (now - softPhaseStartMs < phaseMs) return;
+  long coast = (long)(recentPulseRate * coastTimeSec + 0.5f);
+  long coastCap = (targetPulses * coastPulseCapPct) / 100;
+  if (coast > coastCap) coast = coastCap;
 
-  softValveOpen = !softValveOpen;
-  softPhaseStartMs = now;
-  digitalWrite(relayPin, softValveOpen ? HIGH : LOW);
+  long stopAt = targetPulses - coast;
+  if (stopAt < zoneStart) stopAt = zoneStart;
+  return stopAt;
 }
 
 void startFill() {
@@ -588,7 +588,7 @@ void startFill() {
   lastFlowPulses = 0;
   lastFlowMs     = millis();
   lastLcdMs      = 0;
-  clearSoftFinish();
+  resetPulseRateSample(fillStartMs);
   digitalWrite(relayPin, HIGH);
   Serial.println("Fill started.");
 }
@@ -596,7 +596,6 @@ void startFill() {
 void pauseFill() {
   state = PAUSED;
   pauseStartMs = millis();
-  clearSoftFinish();
   digitalWrite(relayPin, LOW);
   Serial.println("Fill paused at " + String(pulseCount) + " pulses.");
   updateLCDPaused();
@@ -606,20 +605,13 @@ void resumeFill() {
   state = FILLING;
   lastFlowPulses = pulseCount;
   lastFlowMs = millis();
-  clearSoftFinish();
-  // Re-enter soft finish immediately if already past the soft-start threshold
-  long softStartPulses = (long)(targetPulses * softFinishStartPct);
-  if (pulseCount >= softStartPulses) {
-    startSoftFinish(millis());
-  } else {
-    digitalWrite(relayPin, HIGH);
-  }
+  resetPulseRateSample(lastFlowMs);
+  digitalWrite(relayPin, HIGH);
   Serial.println("Fill resumed.");
 }
 
 void abortFill(const char* reason) {
   state = IDLE;
-  clearSoftFinish();
   digitalWrite(relayPin, LOW);
   Serial.print("Fill aborted: ");
   Serial.println(reason);
@@ -630,7 +622,6 @@ void abortFill(const char* reason) {
 
 void stopFill() {
   state = IDLE;
-  clearSoftFinish();
   digitalWrite(relayPin, LOW);
 
   totalFillCount++;
@@ -786,7 +777,6 @@ void runOneLiterCalibration() {
 // Real jug: valve opens, user presses when jug is full (match typical faucet load)
 void runJugCalibration() {
   pulseCount = 0;
-  clearSoftFinish();
   digitalWrite(relayPin, HIGH);
   lcd.setCursor(0, 0);
   lcd.print("Cal: Fill jug   ");
@@ -942,40 +932,25 @@ void loop() {
 
   // ---- FILL / PAUSE SUPERVISION (highest priority) ----
   if (state == FILLING) {
-    if (pulseCount >= targetPulses) {
+    updateRecentPulseRate(now);
+    long stopAt = getFillStopPulses();
+    if (pulseCount >= stopAt) {
+      if (stopAt < targetPulses) {
+        Serial.print("Coast stop: ");
+        Serial.print(pulseCount);
+        Serial.print(" pulses, rate ");
+        Serial.print(recentPulseRate, 1);
+        Serial.println(" p/s");
+      }
       stopFill();
     }
     else if (now - fillStartMs > maxFillTimeMs) {
       abortFill("Timeout");
     }
-    else if (!softFinishActive &&
-             pulseCount == lastFlowPulses &&
-             (now - lastFlowMs) > noFlowTimeoutMs) {
+    else if (pulseCount == lastFlowPulses && (now - lastFlowMs) > noFlowTimeoutMs) {
       abortFill("No flow");
     }
     else {
-      long softStartPulses = (long)(targetPulses * softFinishStartPct);
-      if (pulseCount >= softStartPulses) {
-        if (softFinishActive) {
-          // Keep pulsing until target — never gate maintenance on average pulse rate
-          // (pulsing itself lowers the average and used to freeze the valve closed).
-          updateSoftFinishValve(now);
-          if (!softValveOpen) {
-            lastFlowMs = now;
-          }
-        } else {
-          // Soft-finish is for high pressure splash. If flow is already slow
-          // (other faucets open / low pressure), keep the valve fully open.
-          unsigned long elapsed = now - fillStartMs;
-          float pulseRate = (elapsed > 0) ? ((float)pulseCount * 1000.0f / (float)elapsed) : 0.0f;
-          if (pulseRate >= softFinishMinPulseRate) {
-            startSoftFinish(now);
-          } else {
-            digitalWrite(relayPin, HIGH);
-          }
-        }
-      }
-
       if (pulseCount != lastFlowPulses) {
         lastFlowPulses = pulseCount;
         lastFlowMs     = now;
